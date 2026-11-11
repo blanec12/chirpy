@@ -5,27 +5,9 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"strings"
-	"sync/atomic"
-	"unicode/utf8"
+
+	_ "github.com/lib/pq"
 )
-
-type apiConfig struct {
-	fileServerHits atomic.Int32
-}
-
-func (cfg *apiConfig) middlewareMetricsInc(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		cfg.fileServerHits.Add(1)
-		next.ServeHTTP(w, r)
-	})
-}
-
-func (cfg *apiConfig) getMetrics(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/html")
-	html := fmt.Sprintf("<html><body><h1>Welcome, Chirpy Admin</h1><p>Chirpy has been visited %d times!</p></body></html>", cfg.fileServerHits.Load())
-	w.Write([]byte(html))
-}
 
 func respondWithError(w http.ResponseWriter, code int, msg string) {
 	respondWithJSON(w, code, map[string]string{
@@ -33,7 +15,7 @@ func respondWithError(w http.ResponseWriter, code int, msg string) {
 	})
 }
 
-func respondWithJSON(w http.ResponseWriter, code int, payload interface{}) {
+func respondWithJSON(w http.ResponseWriter, code int, payload any) {
 	data, err := json.Marshal(payload)
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Something went wrong")
@@ -45,75 +27,38 @@ func respondWithJSON(w http.ResponseWriter, code int, payload interface{}) {
 
 }
 
-func (cfg *apiConfig) resetMetrics(w http.ResponseWriter, r *http.Request) {
-	cfg.fileServerHits.Store(0)
-}
-
-func healthz(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("OK"))
-}
-
-func validateChirp(w http.ResponseWriter, r *http.Request) {
-	type chirp struct {
-		Body string `json:"body"`
-	}
-
-	decoder := json.NewDecoder(r.Body)
-	c := chirp{}
-	err := decoder.Decode(&c)
-	if err != nil {
-		respondWithError(w, http.StatusBadRequest, "Something went wrong")
-		return
-	}
-
-	if utf8.RuneCountInString(c.Body) > 140 {
-		respondWithError(w, http.StatusBadRequest, "Chirp is too long")
-		return
-	}
-
-	cleaned_chirp := cleanBody(c.Body)
-
-	respondWithJSON(w, http.StatusOK, map[string]string{
-		"cleaned_body": cleaned_chirp,
-	})
-}
-
-func cleanBody(body string) string {
-	words := strings.Fields(body)
-	badWords := []string{"kerfuffle", "sharbert", "fornax"}
-	for i, word := range words {
-		for _, bad := range badWords {
-			if strings.ToLower(word) == bad {
-				words[i] = "****"
-				break
-			}
-		}
-	}
-	return strings.Join(words, " ")
-}
-
 func main() {
-	const PORT string = ":8080"
-
-	config := &apiConfig{}
+	config, err := NewConfig()
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /admin/metrics", config.getMetrics)
-	mux.HandleFunc("POST /admin/reset", config.resetMetrics)
+	mux.HandleFunc("POST /admin/reset", config.reset)
 
 	mux.HandleFunc("GET /api/healthz", healthz)
-	mux.HandleFunc("POST /api/validate_chirp", validateChirp)
+	mux.HandleFunc("POST /api/login", config.loginUser)
+	mux.HandleFunc("POST /api/refresh", config.refreshAccessToken)
+	mux.HandleFunc("POST /api/revoke", config.revokeRefreshToken)
+	mux.HandleFunc("POST /api/users", config.createUser)
+	mux.HandleFunc("PUT /api/users", config.updateUser)
+	mux.HandleFunc("POST /api/chirps", config.createChirp)
+	mux.HandleFunc("GET /api/chirps", config.getAllChirps)
+	mux.HandleFunc("DELETE /api/chirps/{chirpID}", config.deleteChirp)
+	mux.HandleFunc("GET /api/chirps/{chirpID}", config.getChirp)
+
+	mux.HandleFunc("POST /api/polka/webhooks", config.processWebhook)
+
 	fileServer := http.FileServer(http.Dir("."))
 	appHandler := http.StripPrefix("/app", fileServer)
 	mux.Handle("/app/", config.middlewareMetricsInc(appHandler))
 
 	s := &http.Server{
-		Addr:    ":8080",
+		Addr:    config.port,
 		Handler: mux,
 	}
 
-	fmt.Printf("Server listening on %s", PORT)
+	fmt.Printf("Server listening on %s", config.port)
 	log.Fatal(s.ListenAndServe())
 }
